@@ -72,6 +72,18 @@
 #include <uORB/topics/vehicle_torque_setpoint.h>
 #include <uORB/topics/launch_detection_status.h>
 
+
+
+
+#include <uORB/topics/vehicle_attitude.h>
+#include <uORB/topics/vehicle_local_position.h>
+#include <uORB/topics/vehicle_acceleration.h>
+#include <uORB/topics/debug_array.h>
+
+
+
+
+
 using matrix::Eulerf;
 using matrix::Quatf;
 
@@ -126,6 +138,42 @@ private:
 	uORB::Publication<vehicle_torque_setpoint_s>	_vehicle_torque_setpoint_pub;
 	uORB::Publication<normalized_unsigned_setpoint_s> _flaps_setpoint_pub{ORB_ID(flaps_setpoint)};
 	uORB::Publication<normalized_unsigned_setpoint_s> _spoilers_setpoint_pub{ORB_ID(spoilers_setpoint)};
+
+
+
+
+
+
+
+	uORB::Subscription _vehicle_attitude_sub{ORB_ID(vehicle_attitude)};
+	uORB::Subscription _local_pos_sub{ORB_ID(vehicle_local_position)};
+	uORB::Subscription _vehicle_accel_sub{ORB_ID(vehicle_acceleration)};
+	uORB::Publication<debug_array_s> _cbf_debug_pub{ORB_ID(debug_array)};
+
+	matrix::Vector2f _e_yi{};      // integrator states [e_psI, e_NyI]
+	hrt_abstime _test_start{0};    // set by "fw_rate_control test"
+
+	// 0 = PX4 default PID, 1 = LQR-PI + hard saturation, 2 = LQR-PI + CBF
+	static constexpr int CBF_MODE = 0;
+
+	// Roll-rate doublet (12 s). Short pulses so the plane banks ~30 deg and returns,
+	// instead of rolling 150 deg like the 10 s pulse in the MATLAB script.
+	static float test_pulse(float t)
+	{
+		if (t < 2.f)  { return  1.f; }
+		if (t < 4.f)  { return -1.f; }
+		if (t < 6.f)  { return  0.f; }
+		if (t < 8.f)  { return -1.f; }
+		if (t < 10.f) { return  1.f; }
+		return 0.f;
+	}
+
+
+
+
+
+
+
 
 	manual_control_setpoint_s		_manual_control_setpoint{};
 	vehicle_control_mode_s			_vcontrol_mode{};

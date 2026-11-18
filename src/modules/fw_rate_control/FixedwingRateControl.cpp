@@ -290,7 +290,7 @@ void FixedwingRateControl::Run()
 
 			/* reset integrals where needed */
 			if (_rates_sp.reset_integral) {
-				_rate_control.resetIntegral();
+				_rate_control.resetIntegral();  _e_yi.zero();
 			}
 
 			launch_detection_status_s launch_detection_status{};
@@ -307,7 +307,7 @@ void FixedwingRateControl::Run()
 			if (_landed || !_in_fw_or_transition_wo_tailsitter_transition || control_surfaces_locked) {
 
 				_gain_compression.reset();
-				_rate_control.resetIntegral();
+				_rate_control.resetIntegral();  _e_yi.zero();
 			}
 
 			// Update saturation status from control allocation feedback
@@ -381,6 +381,32 @@ void FixedwingRateControl::Run()
 					body_rates_setpoint = Vector3f(-_rates_sp.yaw, _rates_sp.pitch, _rates_sp.roll);
 				}
 
+
+
+
+
+
+
+
+
+				// ---------------------------------------------------------------------
+				// (B) FixedwingRateControl.cpp — Run(): insert right AFTER line 382
+				//     (after the tailsitter rotation of body_rates_setpoint, BEFORE
+				//      _rate_control.update at line 398, so all 3 modes get the same command)
+				// ---------------------------------------------------------------------
+				const float t_test = (_test_start > 0) ? (hrt_absolute_time() - _test_start) * 1e-6f : -1.f;
+				const bool test_active = (t_test >= 0.f && t_test < 12.f);
+
+				if (test_active) {
+					body_rates_setpoint(0) = radians(15.f) * test_pulse(t_test);   // ps_cmd = +/-15 deg/s
+				}
+
+
+
+
+
+
+
 				const Vector3f gain_ff(_param_fw_rr_ff.get(), _param_fw_pr_ff.get(), _param_fw_yr_ff.get());
 
 				// Positive feedforward compensates aerodynamic damping and is scaled linearly with airspeed.
@@ -407,6 +433,131 @@ void FixedwingRateControl::Run()
 					control_u(2) = _manual_control_setpoint.yaw * _param_fw_man_y_sc.get();
 					_rate_control.resetIntegral(2);
 				}
+
+
+
+
+
+
+
+				// ---------------------------------------------------------------------
+				// (C) FixedwingRateControl.cpp — Run(): insert AFTER line 409
+				//     (replaces the earlier CBF block)
+				// ---------------------------------------------------------------------
+				if (_vcontrol_mode.flag_control_attitude_enabled && !_landed) {
+
+					// ---- Constant matrices from MATLAB (PLACEHOLDERS: regenerate for rc_cessna) ----
+					static const float K_I_d[2][2]     = {{0, 0}, {0, 0}};
+					static const float K_P_d[2][3]     = {{0, 0, 0}, {0, 0, 0}};
+					static const float H_x_d[4][5]     = {};
+					static const float H_u_d[4][4]     = {};
+					static const float H_u_inv_d[4][4] = {};   // inv(H_u), computed in MATLAB
+					static const float aYmax_d[4]      = {};   // alpha * Y_max
+					// static const float u_lim_d[2]      = {0.5f, 0.5f};   // normalized aileron/rudder limits (mode 1)
+					static const float u_lim_d[2] = {0.052f, 0.035f};   // ±3° aileron, ±2° rudder
+
+					const Matrix<float, 2, 2> K_I(K_I_d);
+					const Matrix<float, 2, 3> K_P(K_P_d);
+					const Matrix<float, 4, 5> H_x(H_x_d);
+					const Matrix<float, 4, 4> H_u(H_u_d);
+					const Matrix<float, 4, 4> H_u_inv(H_u_inv_d);
+					const Vector<float, 4> aYmax(aYmax_d);
+
+					// ---- Measurements ----
+					vehicle_attitude_s att{};
+					vehicle_local_position_s lpos{};
+					vehicle_acceleration_s acc{};
+					_vehicle_attitude_sub.copy(&att);
+					_local_pos_sub.copy(&lpos);
+					_vehicle_accel_sub.copy(&acc);
+
+					const Quatf q(att.q);
+					const Vector3f v_b = q.rotateVectorInverse(Vector3f(lpos.vx, lpos.vy, lpos.vz)); // assumes no wind
+					const float Vt = math::max(v_b.norm(), 1.f);
+					const float aoa = atan2f(v_b(2), v_b(0));
+					const float beta = asinf(math::constrain(v_b(1) / Vt, -1.f, 1.f));
+					const float ps = rates(0) * cosf(aoa) + rates(2) * sinf(aoa);   // stability-axis rates
+					const float rs = rates(2) * cosf(aoa) - rates(0) * sinf(aoa);
+					const float Ny = acc.xyz[1] / 9.80665f;                         // lateral accel in g
+
+					// ---- Controller (same logic as MATLAB) ----
+					const Vector3f x_p(beta, ps, rs);
+					const Vector2f y_cmd(body_rates_setpoint(0), 0.f);   // [ps_cmd, Ny_cmd = 0]
+					const Vector2f u_bl = -(K_I * _e_yi) - (K_P * x_p);
+
+					Vector2f V_aw{};
+					Vector2f W{};
+					Vector2f u = u_bl;
+
+					if (CBF_MODE == 2) {
+						Vector<float, 5> x;
+						x(0) = _e_yi(0); x(1) = _e_yi(1); x(2) = beta; x(3) = ps; x(4) = rs;
+						Vector<float, 4> z;
+						z(0) = -y_cmd(0); z(1) = -y_cmd(1); z(2) = u_bl(0); z(3) = u_bl(1);
+
+						const Vector<float, 4> h = H_x * x + H_u * z;
+						Vector<float, 4> rhs;
+
+						for (int i = 0; i < 4; i++) {
+							const float d_min = -h(i) - aYmax(i);   // H_min_delta
+							const float d_max =  h(i) - aYmax(i);   // H_max_delta
+							rhs(i) = math::max(0.f, d_min) - math::max(0.f, d_max);
+						}
+
+						const Vector<float, 4> vw = H_u_inv * rhs;
+						V_aw = Vector2f(vw(0), vw(1));
+						W = Vector2f(vw(2), vw(3));
+						u = u_bl + W;
+
+					} else if (CBF_MODE == 1) {
+						u(0) = math::constrain(u(0), -u_lim_d[0], u_lim_d[0]);
+						u(1) = math::constrain(u(1), -u_lim_d[1], u_lim_d[1]);
+					}
+
+					// if (CBF_MODE > 0) {
+					if (CBF_MODE > 0 && test_active) {
+						_e_yi += (Vector2f(ps, Ny) - y_cmd + V_aw) * dt;
+						control_u(0) = u(0);   // aileron (normalized)
+						control_u(2) = u(1);   // rudder  (normalized)
+						_rate_control.resetIntegral(0);   // add
+    						_rate_control.resetIntegral(2);   // add
+					}
+					if (!test_active) { _e_yi.zero(); }
+
+					// ---- Log everything needed for the MATLAB plots ----
+					debug_array_s dbg{};
+					dbg.timestamp = hrt_absolute_time();
+					dbg.id = 1;
+					// strncpy(dbg.name, "cbf", sizeof(dbg.name));
+					strncpy(dbg.name, "cbf", sizeof(dbg.name) - 1);
+
+					const float vals[] = {
+						_e_yi(0), _e_yi(1),          // 0-1   e_psI, e_NyI
+						beta, ps, rs,                // 2-4   rad, rad/s, rad/s
+						y_cmd(0), Ny, y_cmd(1),      // 5-7   ps_cmd, Ny, Ny_cmd
+						u_bl(0), u_bl(1),            // 8-9   baseline control
+						V_aw(0), V_aw(1),            // 10-11 integrator correction V
+						W(0), W(1),                  // 12-13 control correction W
+						control_u(0), control_u(2),  // 14-15 applied aileron, rudder
+						test_active ? 1.f : 0.f,     // 16    test window flag
+						// (float)CBF_MODE              // 17    which case
+						static_cast<float>(CBF_MODE)
+					};
+
+					for (size_t i = 0; i < sizeof(vals) / sizeof(vals[0]); i++) {
+						dbg.data[i] = vals[i];
+					}
+
+					_cbf_debug_pub.publish(dbg);
+				}
+
+
+
+
+
+
+
+
 
 				if (control_u.isAllFinite()) {
 					matrix::constrain(control_u + trim, -1.f, 1.f).copyTo(_vehicle_torque_setpoint.xyz);
@@ -640,10 +791,48 @@ int FixedwingRateControl::task_spawn(int argc, char *argv[])
 	return PX4_ERROR;
 }
 
+// int FixedwingRateControl::custom_command(int argc, char *argv[])
+// {
+// 	return print_usage("unknown command");
+// }
+
+
+
+
+
+// ---------------------------------------------------------------------
+// (D) FixedwingRateControl.cpp — replace custom_command() (line 643)
+//     Lets you start the test from the pxh> terminal:  fw_rate_control test
+// ---------------------------------------------------------------------
 int FixedwingRateControl::custom_command(int argc, char *argv[])
 {
+	if (argc > 0 && strcmp(argv[0], "test") == 0) {
+		// FixedwingRateControl *obj = desc.object.load();
+		FixedwingRateControl *obj = static_cast<FixedwingRateControl *>(desc.object.load());
+
+		if (obj) {
+			obj->_test_start = hrt_absolute_time();
+			PX4_INFO("CBF test started (12 s), mode %d", CBF_MODE);
+			return 0;
+		}
+	}
+
 	return print_usage("unknown command");
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 int FixedwingRateControl::print_usage(const char *reason)
 {
